@@ -1,5 +1,6 @@
 """Request-local sampling, preserving mode-specific historical arithmetic."""
 from __future__ import annotations
+import os
 import time
 import torch
 from .protocol import EOD, ABC_END, MUSIC_END, CODEC_OFFSET, CODEC_SIZE, CONTEXT
@@ -55,6 +56,30 @@ def distribution(logits, sampling, history, step, phase, legacy_off=False):
     return scores
 
 
+
+class _DecodeStep(torch.nn.Module):
+    """One-token forward, so torch.compile sees a fixed [1, 1] shape per stage."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids, past_key_values):
+        return self.model(input_ids, past_key_values=past_key_values,
+                          use_cache=True, logits_to_keep=1)
+
+
+_decode_steps = {}
+
+
+def _compiled_decode_step(model):
+    step = _decode_steps.get(id(model))
+    if step is None:
+        step = torch.compile(_DecodeStep(model), dynamic=True)
+        _decode_steps[id(model)] = step
+    return step
+
+
 @torch.inference_mode()
 def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_scale=1.0,
                     legacy_off=False, cancelled=None, on_token=None, use_cuda_graph=True):
@@ -86,6 +111,7 @@ def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_sca
     graph = None
     positive_cache = negative_cache = None
     graph_enabled = use_cuda_graph and device.type == "cuda" and not getattr(model, "_yue2_fp8_originals", {})
+    decode_step = _compiled_decode_step(model) if os.environ.get("YUE2_COMPILE") and not graph_enabled else None
     synchronize(device)
     start = time.perf_counter()
     try:
@@ -133,11 +159,16 @@ def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_sca
                     conditional = branch_logits[:1]
                     unconditional = branch_logits[1:] if cfg_scale != 1 else None
                 else:
-                    conditional = model(next_id, past_key_values=positive_cache, use_cache=True,
-                                        logits_to_keep=1).logits[:, -1, :]
-                    if negative_cache is not None:
-                        unconditional = model(next_id, past_key_values=negative_cache, use_cache=True,
-                                              logits_to_keep=1).logits[:, -1, :]
+                    if decode_step is not None:
+                        conditional = decode_step(next_id, positive_cache).logits[:, -1, :]
+                        if negative_cache is not None:
+                            unconditional = decode_step(next_id, negative_cache).logits[:, -1, :]
+                    else:
+                        conditional = model(next_id, past_key_values=positive_cache, use_cache=True,
+                                            logits_to_keep=1).logits[:, -1, :]
+                        if negative_cache is not None:
+                            unconditional = model(next_id, past_key_values=negative_cache, use_cache=True,
+                                                logits_to_keep=1).logits[:, -1, :]
         synchronize(device)
         seconds = time.perf_counter() - start
         count = len(history) + int(eos)
