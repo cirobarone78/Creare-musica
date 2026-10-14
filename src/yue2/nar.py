@@ -67,7 +67,7 @@ def attention(q, k, v, *, causal=False, backend="sdpa", query_chunk_size=None):
     if query_chunk_size is not None and (isinstance(query_chunk_size, bool) or
                                         not isinstance(query_chunk_size, Integral) or query_chunk_size < 1):
         raise ValueError("query_chunk_size must be a positive integer")
-    block = query_chunk_size or (len(q) if q.device.type == "cuda" and backend != "math" else 256)
+    block = query_chunk_size or (len(q) if q.device.type in {"cuda", "xpu"} and backend != "math" else 256)
     query = q.transpose(0, 1).unsqueeze(0)
     key = k.transpose(0, 1).unsqueeze(0)
     value = v.transpose(0, 1).unsqueeze(0)
@@ -124,6 +124,7 @@ class CachedNAR:
         local = torch.arange(self.nar_length, device=self.device).clamp(max=model.config.max_latent_frames - 1)
         self.pos_emb = model.latent_pos_embed(local)[None]
         self.cache = []
+        self.k_buffers = self.v_buffers = None
         self._prefill()
 
     def _attention(self, q, k, v, causal=False):
@@ -147,6 +148,20 @@ class CachedNAR:
             h = self._attention(q[0], k[0], v[0], causal=True)
             x = x + layer.self_attn.o_proj(h.flatten(1)[None])
             x = x + layer.mlp(layer.post_attention_layernorm(x))
+        # One persistent K/V buffer per layer: the AR prefix never changes
+        # during the ODE, so each velocity call rewrites only the NAR tail
+        # instead of re-concatenating the whole cache.
+        self.k_buffers = []
+        self.v_buffers = []
+        for ar_k, ar_v in self.cache:
+            pair = []
+            for ar in (ar_k, ar_v):
+                buffer = torch.empty(self.visible_length + self.nar_length,
+                                     ar.shape[1], ar.shape[2], device=ar.device, dtype=ar.dtype)
+                buffer[:self.visible_length] = ar
+                pair.append(buffer)
+            self.k_buffers.append(pair[0])
+            self.v_buffers.append(pair[1])
 
     @torch.inference_mode()
     def velocity(self, state, raw_t):
@@ -158,10 +173,11 @@ class CachedNAR:
         x = model.vae2llm(x_nar[None])
         x = x + model.time_embedder(shifted.expand(self.nar_length))[None]
         x = x + self.pos_emb
-        for layer, (ar_k, ar_v) in zip(model.model.layers, self.cache):
+        for layer, k_buffer, v_buffer in zip(model.model.layers, self.k_buffers, self.v_buffers):
             q, k, v = layer.nar_self_attn.project_qkv(layer.nar_input_layernorm(x), self.cos, self.sin)
-            k, v = torch.cat((ar_k, k[0])), torch.cat((ar_v, v[0]))
-            h = self._attention(q[0], k, v)
+            k_buffer[self.visible_length:] = k[0]
+            v_buffer[self.visible_length:] = v[0]
+            h = self._attention(q[0], k_buffer, v_buffer)
             x = x + layer.nar_self_attn.o_proj(h.flatten(1)[None])
             x = x + layer.nar_mlp(layer.nar_pre_mlp_layernorm(x))
         return model.llm2vae(model.model.norm(x))[0, 1:-1]
@@ -199,6 +215,7 @@ class CachedNAR:
 
     def close(self):
         self.cache.clear()
+        self.k_buffers = self.v_buffers = None
         self.cos = self.sin = self.pos_emb = None
 
 
