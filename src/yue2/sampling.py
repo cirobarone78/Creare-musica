@@ -56,7 +56,6 @@ def distribution(logits, sampling, history, step, phase, legacy_off=False):
     return scores
 
 
-
 class _DecodeStep(torch.nn.Module):
     """One-token forward, so torch.compile sees a fixed [1, 1] shape per stage."""
 
@@ -110,7 +109,9 @@ def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_sca
 
     graph = None
     positive_cache = negative_cache = None
-    graph_enabled = use_cuda_graph and device.type == "cuda" and not getattr(model, "_yue2_fp8_originals", {})
+    graph_enabled = (use_cuda_graph and not getattr(model, "_yue2_fp8_originals", {})
+                     and (device.type == "cuda"
+                          or (device.type == "xpu" and os.environ.get("YUE2_XPUGRAPH"))))
     decode_step = _compiled_decode_step(model) if os.environ.get("YUE2_COMPILE") and not graph_enabled else None
     synchronize(device)
     start = time.perf_counter()
