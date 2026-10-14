@@ -5,6 +5,7 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 import dataclasses
 import json
+import os
 import time
 import numpy as np
 import torch
@@ -284,7 +285,10 @@ class YuE2Pipeline:
 
     def synthesize(self, semantic, *, cancelled=None):
         from .nar import synthesize
-        if self.backend == "vllm":
+        if self.backend == "vllm" and not os.environ.get("YUE2_VLLM_RESIDENT"):
+            # Free the engine's GPU memory before NAR for small cards. On a
+            # 32 GiB card the resident engine does not slow the NAR down, and
+            # keeping it avoids a ~30 s worker rebuild per song.
             from .fast import close_vllm
             close_vllm(self)
         if not isinstance(semantic, SemanticResult):
