@@ -181,7 +181,7 @@ def __getattr__(name):
                 self.alphas[index].copy_(self.lookup[penalty])
 
         def apply(self, logits):
-            if logits.device.type == "cuda":
+            if logits.device.type in {"cuda", "xpu"}:
                 n = len(logits)
                 self.host[:n].fill_(-1)
                 host = self.host.numpy()
@@ -229,7 +229,16 @@ class _Worker:
         self.log = self.log_path.open("w+")
         env = os.environ.copy()
         env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-        self.process = subprocess.Popen([sys.executable, "-m", "yue2.fast", "--worker"],
+        python = os.environ.get("YUE2_VLLM_PYTHON") or sys.executable
+        if pipe.device.type == "xpu":
+            # oneCCL's libfabric and the torch XPU runtime live in the worker
+            # environment's lib dir; torch finds them by RPATH only once CCL's
+            # own loader has been pointed there.
+            lib = str(Path(python).absolute().parent.parent / "lib")
+            env["LD_LIBRARY_PATH"] = lib + ((":" + env["LD_LIBRARY_PATH"]) if env.get("LD_LIBRARY_PATH") else "")
+            env.setdefault("FI_PROVIDER_PATH", lib)
+            env.setdefault("FI_PROVIDER", "shm")
+        self.process = subprocess.Popen([python, "-m", "yue2.fast", "--worker"],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
                          bufsize=0, env=env, start_new_session=True)
         self.finalizer = weakref.finalize(self, _stop_process, self.process)
@@ -304,8 +313,8 @@ def generate_vllm(pipe, prefix, sampling, seed, phase, negative=None, cfg_scale=
         reason = "paired_cfg_uses_torch"
     elif legacy_off:
         reason = "historical_off_sampling_uses_torch"
-    elif pipe.device.type != "cuda":
-        reason = "vllm_requires_cuda"
+    elif pipe.device.type not in {"cuda", "xpu"}:
+        reason = "vllm_requires_cuda_or_xpu"
     elif pipe.quantization != "none":
         reason = "experimental_fp8_uses_torch"
     if reason:
@@ -327,7 +336,7 @@ def generate_vllm(pipe, prefix, sampling, seed, phase, negative=None, cfg_scale=
         if getattr(pipe, "_vae", None) is not None:
             pipe._vae.to("cpu")
         gc.collect()
-        torch.cuda.empty_cache()
+        (torch.xpu.empty_cache() if pipe.device.type == "xpu" else torch.cuda.empty_cache())
         pipe._vllm_worker = _Worker(pipe)
     payload = {"prefix": list(prefix), "sampling": dataclasses.asdict(sampling),
                "seed": seed, "phase": phase, "stream_tokens": on_token is not None}
@@ -347,7 +356,7 @@ async def _worker_main():
     import torch
     setup = json.loads(sys.stdin.readline())
     device = torch.device(setup["device"])
-    if device.index is not None:
+    if device.type == "cuda" and device.index is not None:
         # vLLM sees one logical device; respect the parent scheduler's mapping.
         visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         os.environ["CUDA_VISIBLE_DEVICES"] = visible.split(",")[device.index] if visible else str(device.index)
@@ -359,7 +368,8 @@ async def _worker_main():
     from vllm.v1.engine.async_llm import AsyncLLM
     derived = derive_ar_checkpoint(setup["model_dir"])
     config = json.loads((derived / "config.json").read_text(encoding="utf-8"))
-    total = torch.cuda.get_device_properties(0).total_memory
+    props = torch.xpu if device.type == "xpu" else torch.cuda
+    total = props.get_device_properties(0).total_memory
     budget = min(setup["memory_budget_gib"] * 2**30, total)
     kv_bytes = kv_cache_bytes(config)
     weights_bytes = (derived / "model.safetensors").stat().st_size

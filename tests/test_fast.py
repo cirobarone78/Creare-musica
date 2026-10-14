@@ -73,7 +73,7 @@ def test_full_context_kv_budget():
 
 @pytest.mark.parametrize("cfg,legacy,reason", [(1.01, True, "paired_cfg_uses_torch"),
                                                (1., True, "historical_off_sampling_uses_torch"),
-                                               (1., False, "vllm_requires_cuda")])
+                                               (1., False, "vllm_requires_cuda_or_xpu")])
 def test_cfg_and_device_fallback_preserve_protocol(monkeypatch, cfg, legacy, reason):
     from yue2 import sampling
     calls, model = [], object()
@@ -132,7 +132,16 @@ def test_fp8_cpu_rejected():
         quant.prepare_fp8_ar(torch.nn.Linear(32, 32), "cpu")
 
 
-@pytest.mark.skipif(importlib.util.find_spec('vllm') is None, reason='Optional vLLM package is not installed')
+def _v2_sampler_available():
+    try:
+        import vllm.v1.worker.gpu.sample.logits_processor  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+@pytest.mark.skipif(importlib.util.find_spec('vllm') is None or _v2_sampler_available(),
+                    reason='Optional vLLM package or its model-runner V1 sampler is not installed')
 def test_window_processor_counting_and_request_moves():
     cls = fast.WindowedPenalty
     processor = cls(SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=2)), 'cpu', False)
