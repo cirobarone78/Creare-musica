@@ -103,8 +103,9 @@ import sys,json
 json.loads(sys.stdin.readline())
 for line in sys.stdin:
     q=json.loads(line)
-    lines=['YUE2_FAST\\t'+json.dumps({'event':'token','token':i}) for i in range(100)]
-    lines.append('YUE2_FAST\\t'+json.dumps({'event':'result','ids':[12], 'timing':{},'truncated':False}))
+    i=q['id']
+    lines=['YUE2_FAST\\t'+json.dumps({'id':i,'event':'token','token':n}) for n in range(100)]
+    lines.append('YUE2_FAST\\t'+json.dumps({'id':i,'event':'result','ids':[12], 'timing':{},'truncated':False}))
     sys.stdout.write('\\n'.join(lines)+'\\n'); sys.stdout.flush()
 """
     monkeypatch.setattr(fast.subprocess, "Popen", lambda command, **kwargs: original_popen([sys.executable, '-c', worker_code], **kwargs))
