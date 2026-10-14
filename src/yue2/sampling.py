@@ -9,6 +9,8 @@ def synchronize(device):
     device = torch.device(device)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+    elif device.type == "xpu":
+        torch.xpu.synchronize(device)
     elif device.type == "mps":
         torch.mps.synchronize()
 
@@ -68,7 +70,7 @@ def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_sca
     if cancelled is not None and cancelled():
         raise InterruptedError("Cancelled before prefill")
     # The two stages deliberately reset their request-local seed, matching the preset.
-    rng_device = device if device.type in {"cpu", "cuda"} else torch.device("cpu")
+    rng_device = device if device.type in {"cpu", "cuda", "xpu"} else torch.device("cpu")
     generator = torch.Generator(device=rng_device).manual_seed(seed)
     config = model.config
 
